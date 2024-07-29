@@ -31,6 +31,9 @@ from rl4co.envs.scheduling.jssp.env import JSSPEnv
 # Graph
 from rl4co.envs.graph import MCPEnv, FLPEnv
 
+# Warehouse
+from rl4co.envs.warehousing import SLAPEnv
+
 # Register environments
 ENV_REGISTRY = {
     "atsp": ATSPEnv,
@@ -56,6 +59,7 @@ ENV_REGISTRY = {
     "tsp_kopt": TSPkoptEnv,
     "mcp": MCPEnv,
     "flp": FLPEnv,
+    "slap": SLAPEnv
 }
 
 
