@@ -84,7 +84,7 @@ class SLAPGenerator(Generator):
         #                    self.max_products_in_order,
         #                    replacement=False)
         n_products = random.randint(1, self.max_products_in_order)
-        order = torch.multinomial(freq.squeeze(-1), n_products, replacement=False)
+        order = [torch.multinomial(freq.squeeze(-1), n_products, replacement=False) for _ in range(self.max_orders)]
         return order
 
     def _create_picklist(self, freq):
@@ -93,8 +93,21 @@ class SLAPGenerator(Generator):
         # for b in range(len(batch_size)):
         #     for i in range(n_orders):
         #         picklist[b, i] = self._sample_order(freq)
-        n_products = random.randint(1, self.max_products_in_order)
-        picklist = torch.multinomial(freq.squeeze(-1), n_products, replacement=False)
+        # n_products = random.randint(1, self.max_products_in_order)
+        # picklist = torch.multinomial(freq.squeeze(-1), n_products, replacement=False)
+        order_batches = []
+        n_batches = freq.squeeze(-1)
+        for _ in n_batches:
+            orders = []
+            for _ in range(self.max_orders):
+                # Random number of items in this order
+                # num_items = np.random.randint(1, self.max_products_in_order + 1)
+                # Generate random SKUs for this order
+                skus = np.random.randint(0, self.n_products, size=self.max_products_in_order).tolist()
+                orders.append(skus)
+            padded_orders = [order + [-1] * (self.max_products_in_order - len(order)) for order in orders]
+            order_batches.append(padded_orders)
+        picklist = torch.tensor(order_batches)
         return picklist
 
     def _generate(self, batch_size) -> TensorDict:

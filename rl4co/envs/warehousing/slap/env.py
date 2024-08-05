@@ -108,12 +108,15 @@ class SLAPEnv(RL4COEnvBase):
     def _get_reward(self, td, actions) -> TensorDict:
         assignment = td["assignment"]
         orders = td["picklist"]
-        subset = assignment[
-            torch.arange(assignment.size(0)
-                         ).unsqueeze(1),
-            orders].to(torch.int)
-        locs_orders = td["locs"][torch.arange(td["locs"].size(0)).unsqueeze(1), subset]
-        total_reward = -get_tour_length(locs_orders)
+        n_batches = orders.shape[0]
+        total_reward = torch.full((n_batches,),0, dtype=torch.float32)
+        for i in range(orders.shape[1]):
+            subset = assignment[
+                torch.arange(assignment.size(0)
+                             ).unsqueeze(1),
+                orders[:, i, :]].to(torch.int)
+            locs_orders = td["locs"][torch.arange(td["locs"].size(0)).unsqueeze(1), subset]
+            total_reward += -get_tour_length(locs_orders)
         return total_reward
 
     def _make_spec(self, generator: SLAPGenerator):
