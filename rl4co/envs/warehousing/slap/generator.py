@@ -44,6 +44,7 @@ class SLAPGenerator(Generator):
         self.freq_sampler = torch.distributions.Uniform(
             low=min_freq, high=max_freq
         )
+        # self.freq_sampler = torch.distributions.Pareto(min_freq, 2.0)
         self.order_sampler = WeightedRandomSampler
 
     @staticmethod
@@ -110,15 +111,38 @@ class SLAPGenerator(Generator):
         picklist = torch.tensor(order_batches)
         return picklist
 
-    def _generate(self, batch_size) -> TensorDict:
-        freq = self.freq_sampler.sample((*batch_size, self.n_products, 1))
-        locs = self._calc_coordinates(batch_size)
+    def _get_order_freq(self, picklist):
+        num_batches = picklist.shape[0]
 
+        # List to store counts for each batch
+        batch_counts = []
+
+        # Process each batch
+        for i in range(num_batches):
+            batch = picklist[i]
+
+            # Flatten the current batch
+            flattened = batch.view(-1)
+
+            # Count occurrences of each position
+            counts = torch.bincount(flattened)
+
+            # Store counts for the current batch
+            batch_counts.append(counts)
+
+        # Convert list to a tensor for easier handling
+        order_freq = torch.stack(batch_counts)
+        return order_freq
+
+    def _generate(self, batch_size) -> TensorDict:
+        item_probabilities = self.freq_sampler.sample((*batch_size, self.n_products, 1))
+        locs = self._calc_coordinates(batch_size)
         dist_mat = self._get_distance_matrix(locs)
         # assignment = torch.full((*batch_size, self.n_locs * self.n_aisles), -1, dtype=torch.float32)
         assignment = torch.full((*batch_size, self.n_products), -1, dtype=torch.int)
-        picklist = self._create_picklist(freq)
-        td = TensorDict({"freq": freq,
+        picklist = self._create_picklist(item_probabilities)
+        # freq = self._get_order_freq(picklist)
+        td = TensorDict({"freq": item_probabilities,
                          "locs": locs,
                          "dist_mat": dist_mat,
                          "assignment": assignment,

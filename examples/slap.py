@@ -16,12 +16,35 @@ class SLAPInitEmbedding(nn.Module):
 
     def __init__(self, embed_dim, linear_bias=True):
         super(SLAPInitEmbedding, self).__init__()
-        node_dim = 2  # x, y
-        self.init_embed = self.init_embed = nn.Linear(node_dim, embed_dim, linear_bias)  # locs
+        node_dim = 3  # x, y, dist_to_depot
+        self.init_embed = nn.Linear(node_dim, embed_dim, linear_bias)  # locs
 
     def forward(self, td):
-        node_embeddings = self.init_embed(td["locs"])
+        dist_mat = self._get_distance_matrix(td["locs"])
+        depot_idx = 0
+        depot_to_all_distances = dist_mat[:,depot_idx, :]
+        node_embeddings = self.init_embed(
+            torch.cat((td["locs"], depot_to_all_distances[..., None]), -1)
+        )
+        print(node_embeddings.shape)
         return node_embeddings
+
+    @staticmethod
+    def _get_distance_matrix(locs: torch.Tensor):
+        """Compute the Manhattan distance matrix for the given coordinates.
+
+        Args:
+            locs: Tensor of shape [..., n, dim]
+        """
+        if locs.dtype != torch.float32 and locs.dtype != torch.float64:
+            locs = locs.to(torch.float32)
+
+            # Compute pairwise differences
+        diff = locs[..., :, None, :] - locs[..., None, :, :]
+
+        # Compute Manhattan distance
+        distance_matrix = torch.sum(torch.abs(diff), dim=-1)
+        return distance_matrix
 
 
 class SLAPContext(EnvContext):

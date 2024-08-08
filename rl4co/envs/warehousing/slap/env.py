@@ -92,6 +92,8 @@ class SLAPEnv(RL4COEnvBase):
         available = torch.ones(
             (*batch_size, td["locs"].shape[1]), dtype=torch.bool, device=device
         )
+        # Depot is not available
+        available[..., 0] = False
         i = torch.zeros((*batch_size, 1), dtype=torch.int64, device=device)
 
         return TensorDict(
