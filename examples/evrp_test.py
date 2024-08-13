@@ -243,6 +243,7 @@ class MTSPEnv(RL4COEnvBase):
 
     @staticmethod
     def _step(td: TensorDict) -> TensorDict:
+        # actionspace multi dimensional -> [[Locations], [charging_duration]]
         dist_mat = td["dist_mat"]
         # Initial variables
         is_first_action = batch_to_scalar(td["i"]) == 0
@@ -251,6 +252,7 @@ class MTSPEnv(RL4COEnvBase):
         dist_traveled = gather_by_index(last_node_to_all, idx=td["action"])
         td["battery"] -= 10 * dist_traveled.view(td["battery"].shape)
         cs_mask = td["action"] == 1
+        # if traveled to charging station, recharge to 100
         td["battery"][cs_mask] = 100
         current_node = td["action"]
         first_node = current_node if is_first_action else td["first_node"]
@@ -261,10 +263,11 @@ class MTSPEnv(RL4COEnvBase):
             td["locs"], td["current_node"]
         )  # current_node is the previous node
         depot_loc = td["locs"][..., 0, :]
-        charging_loc = td["locs"][..., 1, :]
 
         # If current_node is the depot, then increment agent_idx
         cur_agent_idx = td["agent_idx"] + (current_node == 0).long()
+        # If agent_idx is increased, vehicle is refueled
+        td["battery"] += (current_node == 0).long().view(td["battery"].shape) * (100 - td["battery"])
 
         # Set not visited to 0 (i.e., we visited the node)
         available = td["available"].scatter(
@@ -307,10 +310,10 @@ class MTSPEnv(RL4COEnvBase):
                 idx = torch.squeeze(done).nonzero().squeeze(0)
                 action_mask[idx, 1] = 0
                 action_mask[idx, 0] = 1
-            just_charged = td["battery"] == 100
+            # just_charged = td["battery"] == 100
             # make sure that charging location can not be visited if just recharged
-            if just_charged.any():
-                idx = torch.squeeze(just_charged).nonzero().squeeze(0)
+            if cs_mask.any():
+                idx = torch.squeeze(cs_mask).nonzero().squeeze(0)
                 action_mask[idx, 1] = 0
         for i in range(action_mask.shape[0]):
             if torch.all(action_mask[i] == False):
@@ -335,7 +338,8 @@ class MTSPEnv(RL4COEnvBase):
 
         # The reward is the negative of the max_subtour_length (minmax objective)
         reward = -max_subtour_length
-
+        if done.all():
+            pass
         td.update(
             {
                 "max_subtour_length": max_subtour_length,
