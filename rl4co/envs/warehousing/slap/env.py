@@ -60,13 +60,32 @@ class SLAPEnv(RL4COEnvBase):
         mask = td["action_mask"].clone()
         for batch in range(batch_size):
             mask[batch][location_idx[batch]] = False
+        # dist_mat = self._get_distance_matrix(td["locs"])
+        # depot_idx = 0
+        # depot_to_all_distances = dist_mat[:, depot_idx, :]
+        # next_product = td["to_choose"][..., 0]
+        # next_product = next_product.to(torch.int)
+        # next_product_freq = td["freq"][
+        #     torch.arange(td["freq"].size(0)
+        #                  ).unsqueeze(0),
+        #     next_product].to(torch.int)
+        # n_locs = td["depot_loc_dist"].shape[1]
+        # val1 = next_product_freq[0, 0, 0].item()
+        # val2 = next_product_freq[0, 1, 0].item()
+        # first_row = torch.full((n_locs,), val1, dtype=torch.int32)  # Shape: [100]
+        # second_row = torch.full((n_locs,), val2, dtype=torch.int32)  # Shape: [100]
+        #
+        # final_tensor = torch.stack((first_row, second_row), dim=0)
+        # # print(f"{final_tensor.shape} / {td['depot_loc_dist'].shape}")
+        # ratio = td["depot_loc_dist"] / next_product_freq.unsqueeze(-1)
+        # ratio[..., 0] = 0
         td.update(
             {
                 # states changed by actions
                 "assignment": assignment,
                 "to_choose": to_choose,
                 "action_mask": mask,
-                "i": td["i"] + 1,  # the number of sets we have chosen
+                "i": td["i"] + 1,  # the number of products we have chosen
                 "reward": torch.zeros_like(done),
                 "done": done,
             }
@@ -92,6 +111,7 @@ class SLAPEnv(RL4COEnvBase):
         available = torch.ones(
             (*batch_size, td["locs"].shape[1]), dtype=torch.bool, device=device
         )
+        ratio = torch.zeros(td["depot_loc_dist"].shape)
         # Depot is not available
         available[..., 0] = False
         i = torch.zeros((*batch_size, 1), dtype=torch.int64, device=device)
@@ -101,6 +121,7 @@ class SLAPEnv(RL4COEnvBase):
                 "assignment": init_assignment,
                 "to_choose": to_choose,
                 "i": i,
+                "ratio": ratio,
                 "action_mask": available,
                 "reward": torch.zeros((*batch_size, 1), dtype=torch.float32),
             },
@@ -123,7 +144,12 @@ class SLAPEnv(RL4COEnvBase):
 
     def _make_spec(self, generator: SLAPGenerator):
         # TODO: make spec
-        pass
+        self.action_spec = BoundedTensorSpec(
+            shape=(1,),
+            dtype=torch.int64,
+            low=0,
+            high=self.generator.n_locs,
+        )
 
     def render(self, td, actions=None, ax=None):
         import matplotlib.pyplot as plt

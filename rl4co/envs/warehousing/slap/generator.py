@@ -138,6 +138,8 @@ class SLAPGenerator(Generator):
         item_probabilities = self.freq_sampler.sample((*batch_size, self.n_products, 1))
         locs = self._calc_coordinates(batch_size)
         dist_mat = self._get_distance_matrix(locs)
+        depot_idx = 0
+        depot_to_all_distances = dist_mat[:, depot_idx, :]
         # assignment = torch.full((*batch_size, self.n_locs * self.n_aisles), -1, dtype=torch.float32)
         assignment = torch.full((*batch_size, self.n_products), -1, dtype=torch.int)
         picklist = self._create_picklist(item_probabilities)
@@ -146,7 +148,8 @@ class SLAPGenerator(Generator):
                          "locs": locs,
                          "dist_mat": dist_mat,
                          "assignment": assignment,
-                         "picklist": picklist},
+                         "picklist": picklist,
+                         "depot_loc_dist": depot_to_all_distances},
                         batch_size=batch_size)
         return td
 
