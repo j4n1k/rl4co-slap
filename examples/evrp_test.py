@@ -4,6 +4,7 @@ import numpy as np
 import torch
 
 from tensordict.tensordict import TensorDict
+from torch import nn
 from torchrl.data import (
     BoundedTensorSpec,
     CompositeSpec,
@@ -13,6 +14,8 @@ from torchrl.data import (
 
 from rl4co.envs.common.base import RL4COEnvBase
 from rl4co.envs.common.utils import batch_to_scalar
+from rl4co.models import AttentionModelPolicy
+from rl4co.models.nn.env_embeddings.context import EnvContext
 from rl4co.utils import RL4COTrainer
 from rl4co.utils.ops import gather_by_index, get_distance, get_tour_length
 from rl4co.models.zoo import AttentionModel
@@ -56,7 +59,6 @@ def render(td, actions=None, ax=None):
     num_agents = td["num_agents"]
     locs = td["locs"]
     cmap = discrete_cmap(num_agents, "rainbow")
-
     fig, ax = plt.subplots()
 
     # Add depot action = 0 to before first action and after last action
@@ -102,9 +104,16 @@ def render(td, actions=None, ax=None):
 
     # Plot the actions in order
     agent_idx = 0
+    agent_travel_time = 0
+    max_travel = 0
+    n_charges = {i+1: 0 for i in range(num_agents)}
+    battery_levels = {i+1: [100] for i in range(num_agents)}
     for i in range(len(actions)):
         if actions[i] == 0:
             agent_idx += 1
+            if agent_travel_time > max_travel:
+                max_travel = agent_travel_time
+            agent_travel_time = 0
         color = cmap(num_agents - agent_idx)
 
         from_node = actions[i]
@@ -113,6 +122,14 @@ def render(td, actions=None, ax=None):
         )  # last goes back to depot
         from_loc = td["locs"][from_node]
         to_loc = td["locs"][to_node]
+        travel_time = get_distance(from_loc, to_loc)
+        if agent_idx <= num_agents:
+            battery_levels[agent_idx].append(battery_levels[agent_idx][-1] - 2 * travel_time)
+        if to_node == 1:
+            travel_time += 300
+            n_charges[agent_idx] += 1
+            battery_levels[agent_idx].append(100)
+        agent_travel_time += travel_time
         ax.plot([from_loc[0], to_loc[0]], [from_loc[1], to_loc[1]], color=color)
         ax.annotate(
             "",
@@ -121,7 +138,9 @@ def render(td, actions=None, ax=None):
             arrowprops=dict(arrowstyle="->", color=color),
             annotation_clip=False,
         )
-
+    print(max_travel)
+    print(n_charges)
+    print(battery_levels)
     # Legend
     handles, labels = ax.get_legend_handles_labels()
     ax.legend(handles, labels)
@@ -321,9 +340,17 @@ class MTSPEnv(RL4COEnvBase):
         # Update the current length
         current_length = td["current_length"] + get_distance(cur_loc, prev_loc)
 
-        # If done, we add the distance from the current_node to the depot as well
+        # Update service time
+        current_duration = td["current_duration"] + get_distance(cur_loc, prev_loc)
+        current_duration[cs_mask] += 300
+
+        # If done, we add the distance and duration from the current_node to the depot as well
         current_length = torch.where(
             done, current_length + get_distance(cur_loc, depot_loc), current_length
+        )
+
+        current_duration = torch.where(
+            done, current_duration + get_distance(cur_loc, depot_loc), current_duration
         )
 
         # We update the max_subtour_length and reset the current_length
@@ -333,17 +360,27 @@ class MTSPEnv(RL4COEnvBase):
             td["max_subtour_length"],
         )
 
+        max_subtour_duration = torch.where(
+            current_duration > td["max_subtour_duration"],
+            current_duration,
+            td["max_subtour_duration"],
+        )
+
         # If current agent is different from previous agent, then we have a new subtour and reset the length
         current_length *= (cur_agent_idx == td["agent_idx"]).float()
+        current_duration *= (cur_agent_idx == td["agent_idx"]).float()
 
         # The reward is the negative of the max_subtour_length (minmax objective)
-        reward = -max_subtour_length
+        # reward = -max_subtour_length
+        reward = -max_subtour_duration
         if done.all():
             pass
         td.update(
             {
                 "max_subtour_length": max_subtour_length,
+                "max_subtour_duration": max_subtour_duration,
                 "current_length": current_length,
+                "current_duration": current_duration,
                 "agent_idx": cur_agent_idx,
                 "first_node": first_node,
                 "current_node": current_node,
@@ -367,6 +404,10 @@ class MTSPEnv(RL4COEnvBase):
         max_subtour_length = torch.zeros(batch_size, dtype=torch.float32, device=device)
         current_length = torch.zeros(batch_size, dtype=torch.float32, device=device)
 
+        # service time tracker
+        max_subtour_duration = torch.zeros(batch_size, dtype=torch.float32, device=device)
+        current_duration = torch.zeros(batch_size, dtype=torch.float32, device=device)
+
         # Other variables
         current_node = torch.zeros((*batch_size,), dtype=torch.int64, device=device)
         available = torch.ones(
@@ -389,7 +430,9 @@ class MTSPEnv(RL4COEnvBase):
                 "locs": td["locs"],  # depot is first node
                 "num_agents": td["num_agents"],
                 "max_subtour_length": max_subtour_length,
+                "max_subtour_duration": max_subtour_duration,
                 "current_length": current_length,
+                "current_duration": current_duration,
                 "agent_idx": agent_idx,
                 "first_node": current_node,
                 "current_node": current_node,
@@ -399,7 +442,7 @@ class MTSPEnv(RL4COEnvBase):
                 "charging_mask": charging_mask,
                 "dist_mat": dist_mat,
                 "battery": battery,
-                "threshold": threshold
+                "threshold": threshold,
             },
             batch_size=batch_size,
         )
@@ -496,22 +539,74 @@ class MTSPEnv(RL4COEnvBase):
         return render(td, actions, ax)
 
 
+class MTSPContext(EnvContext):
+    """Context embedding for the Multiple Traveling Salesman Problem (mTSP).
+    Project the following to the embedding space:
+        - current node embedding
+        - remaining_agents
+        - current_length
+        - max_subtour_length
+        - distance_from_depot
+    """
+
+    def __init__(self, embed_dim, linear_bias=False):
+        super(MTSPContext, self).__init__(embed_dim, 2 * embed_dim)
+        proj_in_dim = (
+            6  # remaining_agents, current_length, max_subtour_length, distance_from_depot, battery level, dist_to_cs
+        )
+        self.proj_dynamic_feats = nn.Linear(proj_in_dim, embed_dim, bias=linear_bias)
+
+    def _cur_node_embedding(self, embeddings, td):
+        cur_node_embedding = gather_by_index(embeddings, td["current_node"])
+        return cur_node_embedding.squeeze()
+
+    def _state_embedding(self, embeddings, td):
+        dynamic_feats = torch.stack(
+            [
+                (td["num_agents"] - td["agent_idx"]).float(),
+                td["current_length"],
+                td["max_subtour_length"],
+                self._distance_from_depot(td),
+                td["battery"].view(td["current_length"].shape),
+                self._distance_from_cs(td)
+            ],
+            dim=-1,
+        )
+        return self.proj_dynamic_feats(dynamic_feats)
+
+    def _distance_from_depot(self, td):
+        # Euclidean distance from the depot (loc[..., 0, :])
+        cur_loc = gather_by_index(td["locs"], td["current_node"])
+        return torch.norm(cur_loc - td["locs"][..., 0, :], dim=-1)
+
+    def _distance_from_cs(self, td):
+        # Euclidean distance from the depot (loc[..., 0, :])
+        cur_loc = gather_by_index(td["locs"], td["current_node"])
+        return torch.norm(cur_loc - td["locs"][..., 1, :], dim=-1)
+
+
 def main():
     env = MTSPEnv()
+    emb_dim = 128
+    policy = AttentionModelPolicy(env_name=env.name,
+                                  # this is actually not needed since we are initializing the embeddings!
+                                  embed_dim=emb_dim,
+                                  context_embedding=MTSPContext(emb_dim),
+                                  )
     model = AttentionModel(env,
                            baseline='rollout',
                            train_data_size=100_000,  # really small size for demo
                            val_data_size=10_000)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     td_init = env.reset(batch_size=[4]).to(device)
-    policy = model.policy.to(device)
+    # policy = model.policy.to(device)
     out = policy(td_init.clone(), env, phase="test", decode_type="greedy", return_actions=True)
 
     # Plotting
     print(f"Tour lengths: {[f'{-r.item():.2f}' for r in out['reward']]}")
-    # for td, actions in zip(td_init, out['actions'].cpu()):
-    #     fig = env.render(td, actions)
-    #     fig.show()
+    for td, actions in zip(td_init, out['actions'].cpu()):
+        fig = env.render(td, actions)
+        fig.show()
 
     trainer = RL4COTrainer(max_epochs=1, devices="auto")
     trainer.fit(model)
