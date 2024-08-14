@@ -16,6 +16,8 @@ from rl4co.envs.common.base import RL4COEnvBase
 from rl4co.envs.common.utils import batch_to_scalar
 from rl4co.models import AttentionModelPolicy
 from rl4co.models.nn.env_embeddings.context import EnvContext
+from rl4co.models.nn.env_embeddings.dynamic import StaticEmbedding
+from rl4co.models.nn.env_embeddings.init import MTSPInitEmbedding
 from rl4co.utils import RL4COTrainer
 from rl4co.utils.ops import gather_by_index, get_distance, get_tour_length
 from rl4co.models.zoo import AttentionModel
@@ -591,15 +593,18 @@ def main():
     policy = AttentionModelPolicy(env_name=env.name,
                                   # this is actually not needed since we are initializing the embeddings!
                                   embed_dim=emb_dim,
+                                  init_embedding=MTSPInitEmbedding(emb_dim),
                                   context_embedding=MTSPContext(emb_dim),
+                                  dynamic_embedding=StaticEmbedding(emb_dim)
                                   )
     model = AttentionModel(env,
                            baseline='rollout',
+                           policy=policy,
                            train_data_size=100_000,  # really small size for demo
                            val_data_size=10_000)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     td_init = env.reset(batch_size=[4]).to(device)
-    # policy = model.policy.to(device)
+    policy = model.policy.to(device)
     out = policy(td_init.clone(), env, phase="test", decode_type="greedy", return_actions=True)
 
     # Plotting
