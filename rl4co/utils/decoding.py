@@ -22,6 +22,7 @@ def get_decoding_strategy(decoding_strategy, **config):
         "multistart_sampling": Sampling,
         "beam_search": BeamSearch,
         "evaluate": Evaluate,
+        "multisampling": MultiSampling
     }
 
     if decoding_strategy not in strategy_registry:
@@ -222,6 +223,7 @@ class DecodingStrategy(metaclass=abc.ABCMeta):
         improvement_method_mode: bool = False,
         select_best: bool = False,
         store_all_logp: bool = False,
+        key: str = "action",
         **kwargs,
     ) -> None:
         self.temperature = temperature
@@ -236,6 +238,7 @@ class DecodingStrategy(metaclass=abc.ABCMeta):
         self.improvement_method_mode = improvement_method_mode
         self.select_best = select_best
         self.store_all_logp = store_all_logp
+        self.key = key
         # initialize buffers
         self.actions = []
         self.logprobs = []
@@ -359,7 +362,7 @@ class DecodingStrategy(metaclass=abc.ABCMeta):
         # for others
         if not self.store_all_logp:
             logprobs = gather_by_index(logprobs, selected_action, dim=1)
-        td.set("action", selected_action)
+        td.set(self.key, selected_action)
         self.actions.append(selected_action)
         self.logprobs.append(logprobs)
         return td
@@ -411,6 +414,60 @@ class Greedy(DecodingStrategy):
     ) -> Tuple[torch.Tensor, torch.Tensor, TensorDict]:
         """Select the action with the highest log probability"""
         selected = self.greedy(logprobs, mask)
+        return logprobs, selected, td
+
+
+class MultiSampling(DecodingStrategy):
+    name = "multisampling"
+
+    def step(
+            self,
+            logits: torch.Tensor,
+            mask: torch.Tensor,
+            td: TensorDict = None,
+            action: torch.Tensor = None,
+            **kwargs,
+    ) -> TensorDict:
+        """Main decoding operation. This method should be called in a loop until all sequences are done.
+
+        Args:
+            logits: Logits from the model.
+            mask: Action mask. 1 if feasible, 0 otherwise (so we keep if 1 as done in PyTorch).
+            td: TensorDict containing the current state of the environment.
+            action: Optional action to use, e.g. for evaluating log probabilities.
+        """
+        if not self.mask_logits:  # set mask_logit to None if mask_logits is False
+            mask = None
+
+        logprobs = process_logits(
+            logits,
+            mask,
+            temperature=self.temperature,
+            top_p=self.top_p,
+            top_k=self.top_k,
+            tanh_clipping=self.tanh_clipping,
+            mask_logits=self.mask_logits,
+        )
+        logprobs, selected_action, td = self._step(
+            logprobs, mask, td, action=action, **kwargs
+        )
+
+        # directly return for improvement methods, since the action for improvement methods is finalized in its own policy
+        if self.improvement_method_mode:
+            return logprobs, selected_action
+        # for others
+        if not self.store_all_logp:
+            logprobs = gather_by_index(logprobs, selected_action, dim=1)
+        td.set(self.key, selected_action)
+        self.actions.append(selected_action)
+        self.logprobs.append(logprobs)
+        return td
+
+    def _step(
+        self, logprobs: torch.Tensor, mask: torch.Tensor, td: TensorDict, **kwargs
+    ) -> Tuple[torch.Tensor, torch.Tensor, TensorDict]:
+        """Sample an action with a multinomial distribution given by the log probabilities."""
+        selected = self.sampling(logprobs, mask)
         return logprobs, selected, td
 
 

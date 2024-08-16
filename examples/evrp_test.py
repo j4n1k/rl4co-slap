@@ -12,14 +12,20 @@ from torchrl.data import (
     UnboundedDiscreteTensorSpec,
 )
 
+from rl4co.envs import get_env
 from rl4co.envs.common.base import RL4COEnvBase
 from rl4co.envs.common.utils import batch_to_scalar
-from rl4co.models import AttentionModelPolicy
+from rl4co.models import AttentionModelPolicy, ConstructivePolicy, ConstructiveEncoder, ConstructiveDecoder, \
+    AutoregressiveEncoder, AutoregressiveDecoder, MatNetPolicy
+from rl4co.models.common.constructive.base import NoEncoder
 from rl4co.models.nn.env_embeddings.context import EnvContext
 from rl4co.models.nn.env_embeddings.dynamic import StaticEmbedding
 from rl4co.models.nn.env_embeddings.init import MTSPInitEmbedding
+from rl4co.models.zoo.am.decoder import AttentionModelDecoder
+from rl4co.models.zoo.am.encoder import AttentionModelEncoder
 from rl4co.utils import RL4COTrainer
-from rl4co.utils.ops import gather_by_index, get_distance, get_tour_length
+from rl4co.utils.decoding import DecodingStrategy, get_decoding_strategy, get_log_likelihood, process_logits
+from rl4co.utils.ops import gather_by_index, get_distance, get_tour_length, calculate_entropy
 from rl4co.models.zoo import AttentionModel
 
 from typing import Callable, Union
@@ -264,17 +270,18 @@ class MTSPEnv(RL4COEnvBase):
 
     @staticmethod
     def _step(td: TensorDict) -> TensorDict:
-        # actionspace multi dimensional -> [[Locations], [charging_duration]]
+        # Make actionspace multi dimensional? -> [[Locations], [charging_duration]]
         dist_mat = td["dist_mat"]
         # Initial variables
         is_first_action = batch_to_scalar(td["i"]) == 0
         last_node_to_all = gather_by_index(dist_mat, idx=td["current_node"])
         # distance traveled from last node to current node
         dist_traveled = gather_by_index(last_node_to_all, idx=td["action"])
+        target_battery_level = gather_by_index(td["thresholds"], td["charging_duration"])
         td["battery"] -= 10 * dist_traveled.view(td["battery"].shape)
         cs_mask = td["action"] == 1
-        # if traveled to charging station, recharge to 100
-        td["battery"][cs_mask] = 100
+        # if traveled to charging station, recharge
+        td["battery"][cs_mask] = target_battery_level[cs_mask]
         current_node = td["action"]
         first_node = current_node if is_first_action else td["first_node"]
 
@@ -289,6 +296,8 @@ class MTSPEnv(RL4COEnvBase):
         cur_agent_idx = td["agent_idx"] + (current_node == 0).long()
         # If agent_idx is increased, vehicle is refueled
         td["battery"] += (current_node == 0).long().view(td["battery"].shape) * (100 - td["battery"])
+        comp = td["thresholds"] >= td["battery"][:, None, :]
+        comp = comp.squeeze()
 
         # Set not visited to 0 (i.e., we visited the node)
         available = td["available"].scatter(
@@ -338,7 +347,10 @@ class MTSPEnv(RL4COEnvBase):
                 action_mask[idx, 1] = 0
         for i in range(action_mask.shape[0]):
             if torch.all(action_mask[i] == False):
-                print("ERROR")
+               # print("ERROR")
+                # TODO: Vehicle was just charged but to low and we can't reach anything else -> need to recharge again
+                # Edge Case
+                action_mask[i, 1] = 1
         # Update the current length
         current_length = td["current_length"] + get_distance(cur_loc, prev_loc)
 
@@ -388,6 +400,7 @@ class MTSPEnv(RL4COEnvBase):
                 "current_node": current_node,
                 "i": td["i"] + 1,
                 "action_mask": action_mask,
+                "charging_duration_mask": comp,
                 "reward": reward,
                 "done": done,
                 "available": available
@@ -424,7 +437,15 @@ class MTSPEnv(RL4COEnvBase):
         threshold = torch.full(
             (*batch_size, 1), 30, device=device
         )
+        values = torch.tensor([100.0])
+        n_th = values.shape[0]
+        charging_duration_mask = torch.ones((*batch_size, n_th), dtype=torch.bool, device=device)
+        # thresholds = torch.full((batch_size[0], 5, 1), 70.0)
+        thresholds = torch.arange(
+            values.min().item(), values.max().item() + 1, step=10).repeat(batch_size[0], 1).view(batch_size[0], n_th, 1)
+        charging_duration = torch.zeros((*batch_size,), dtype=torch.int64, device=device)
         dist_mat = self._get_distance_matrix(td["locs"])
+        dist_mat = dist_mat.to(device)
         i = torch.zeros((*batch_size,), dtype=torch.int64, device=device)
 
         return TensorDict(
@@ -442,9 +463,12 @@ class MTSPEnv(RL4COEnvBase):
                 "available": available,
                 "action_mask": available,
                 "charging_mask": charging_mask,
+                "charging_duration_mask": charging_duration_mask,
+                "charging_duration": charging_duration,
                 "dist_mat": dist_mat,
                 "battery": battery,
                 "threshold": threshold,
+                "thresholds": thresholds
             },
             batch_size=batch_size,
         )
@@ -541,6 +565,23 @@ class MTSPEnv(RL4COEnvBase):
         return render(td, actions, ax)
 
 
+class ChargingInitEmbedding(nn.Module):
+    """Initial embedding for the Multiple Traveling Salesman Problem (mTSP).
+    Embed the following node features to the embedding space:
+        - locs: x, y coordinates of the nodes (depot, cities)
+    """
+
+    def __init__(self, embed_dim, linear_bias=True):
+        """NOTE: new made by Fede. May need to be checked"""
+        super(ChargingInitEmbedding, self).__init__()
+        node_dim = 1  # x, y
+        self.init_embed = nn.Linear(node_dim, embed_dim, linear_bias)
+
+    def forward(self, td):
+        threshold_embedding = self.init_embed(td["thresholds"])
+        return threshold_embedding
+
+
 class MTSPContext(EnvContext):
     """Context embedding for the Multiple Traveling Salesman Problem (mTSP).
     Project the following to the embedding space:
@@ -586,6 +627,417 @@ class MTSPContext(EnvContext):
         cur_loc = gather_by_index(td["locs"], td["current_node"])
         return torch.norm(cur_loc - td["locs"][..., 1, :], dim=-1)
 
+    def forward(self, embeddings, td):
+        if embeddings.shape[-2] == td["locs"].shape[-2]:
+            state_embedding = self._state_embedding(embeddings, td)
+            cur_node_embedding = self._cur_node_embedding(embeddings, td)
+            context_embedding = torch.cat([cur_node_embedding, state_embedding], -1)
+            return self.project_context(context_embedding)
+        else:
+            return embeddings.new_zeros(embeddings.size(0), self.embed_dim)
+
+
+class MultiConstructivePolicy(nn.Module):
+    """
+    Base class for constructive policies. Constructive policies take as input and instance and output a solution (sequence of actions).
+    "Constructive" means that a solution is created from scratch by the model.
+
+    The structure follows roughly the following steps:
+        1. Create a hidden state from the encoder
+        2. Initialize decoding strategy (such as greedy, sampling, etc.)
+        3. Decode the action given the hidden state and the environment state at the current step
+        4. Update the environment state with the action. Repeat 3-4 until all sequences are done
+        5. Obtain log likelihood, rewards etc.
+
+    Note that an encoder is not strictly needed (see :class:`NoEncoder`).). A decoder however is always needed either in the form of a
+    network or a function.
+
+    Note:
+        There are major differences between this decoding and most RL problems. The most important one is
+        that reward may not defined for partial solutions, hence we have to wait for the environment to reach a terminal
+        state before we can compute the reward with `env.get_reward()`.
+
+    Warning:
+        We suppose environments in the `done` state are still available for sampling. This is because in NCO we need to
+        wait for all the environments to reach a terminal state before we can stop the decoding process. This is in
+        contrast with the TorchRL framework (at the moment) where the `env.rollout` function automatically resets.
+        You may follow tighter integration with TorchRL here: https://github.com/ai4co/rl4co/issues/72.
+
+    Args:
+        encoder: Encoder to use
+        decoder: Decoder to use
+        env_name: Environment name to solve (used for automatically instantiating networks)
+        temperature: Temperature for the softmax during decoding
+        tanh_clipping: Clipping value for the tanh activation (see Bello et al. 2016) during decoding
+        mask_logits: Whether to mask the logits or not during decoding
+        train_decode_type: Decoding strategy for training
+        val_decode_type: Decoding strategy for validation
+        test_decode_type: Decoding strategy for testing
+    """
+
+    def __init__(
+        self,
+        location_encoder: Union[ConstructiveEncoder, Callable],
+        charging_encoder: Union[ConstructiveEncoder, Callable],
+        location_decoder: Union[ConstructiveDecoder, Callable],
+        charging_decoder: Union[ConstructiveDecoder, Callable],
+        env_name: str = "tsp",
+        temperature: float = 1.0,
+        tanh_clipping: float = 0,
+        mask_logits: bool = True,
+        train_decode_type: str = "sampling",
+        val_decode_type: str = "greedy",
+        test_decode_type: str = "greedy",
+        **unused_kw,
+    ):
+        super(MultiConstructivePolicy, self).__init__()
+
+        if len(unused_kw) > 0:
+            log.error(f"Found {len(unused_kw)} unused kwargs: {unused_kw}")
+
+        self.env_name = env_name
+
+        # Encoder and decoder
+        # if encoder is None:
+        #     log.warning("`None` was provided as encoder. Using `NoEncoder`.")
+        #     encoder = NoEncoder()
+        self.location_encoder = location_encoder
+        self.charging_encoder = charging_encoder
+        self.location_decoder = location_decoder
+        self.charging_decoder = charging_decoder
+        # Decoding strategies
+        self.temperature = temperature
+        self.tanh_clipping = tanh_clipping
+        self.mask_logits = mask_logits
+        self.train_decode_type = train_decode_type
+        self.val_decode_type = val_decode_type
+        self.test_decode_type = test_decode_type
+
+    def forward(
+        self,
+        td: TensorDict,
+        env: Optional[Union[str, RL4COEnvBase]] = None,
+        phase: str = "train",
+        calc_reward: bool = True,
+        return_actions: bool = False,
+        return_entropy: bool = False,
+        return_hidden: bool = False,
+        return_init_embeds: bool = False,
+        return_sum_log_likelihood: bool = True,
+        actions=None,
+        max_steps=1_000_000,
+        **decoding_kwargs,
+    ) -> dict:
+        """Forward pass of the policy.
+
+        Args:
+            td: TensorDict containing the environment state
+            env: Environment to use for decoding. If None, the environment is instantiated from `env_name`. Note that
+                it is more efficient to pass an already instantiated environment each time for fine-grained control
+            phase: Phase of the algorithm (train, val, test)
+            calc_reward: Whether to calculate the reward
+            return_actions: Whether to return the actions
+            return_entropy: Whether to return the entropy
+            return_hidden: Whether to return the hidden state
+            return_init_embeds: Whether to return the initial embeddings
+            return_sum_log_likelihood: Whether to return the sum of the log likelihood
+            actions: Actions to use for evaluating the policy.
+                If passed, use these actions instead of sampling from the policy to calculate log likelihood
+            max_steps: Maximum number of decoding steps for sanity check to avoid infinite loops if envs are buggy (i.e. do not reach `done`)
+            decoding_kwargs: Keyword arguments for the decoding strategy. See :class:`rl4co.utils.decoding.DecodingStrategy` for more information.
+
+        Returns:
+            out: Dictionary containing the reward, log likelihood, and optionally the actions and entropy
+        """
+
+        # Encoder: get encoder output and initial embeddings from initial state
+        hidden_l, init_embeds_location = self.location_encoder(td)
+        hidden_c, init_embeds_charging = self.charging_encoder(td)
+
+        # Instantiate environment if needed
+        if isinstance(env, str) or env is None:
+            env_name = self.env_name if env is None else env
+            log.info(f"Instantiated environment not provided; instantiating {env_name}")
+            env = get_env(env_name)
+
+        # Get decode type depending on phase and whether actions are passed for evaluation
+        decode_type = decoding_kwargs.pop("decode_type", None)
+        if actions is not None:
+            decode_type = "evaluate"
+        elif decode_type is None:
+            decode_type = getattr(self, f"{phase}_decode_type")
+
+        # Setup decoding strategy
+        # we pop arguments that are not part of the decoding strategy
+        decode_strategy_nodes: DecodingStrategy = get_decoding_strategy(
+            decode_type,
+            temperature=decoding_kwargs.pop("temperature", self.temperature),
+            tanh_clipping=decoding_kwargs.pop("tanh_clipping", self.tanh_clipping),
+            mask_logits=decoding_kwargs.pop("mask_logits", self.mask_logits),
+            store_all_logp=decoding_kwargs.pop("store_all_logp", return_entropy),
+            key="action",
+            **decoding_kwargs,
+        )
+
+        decode_strategy_charging: DecodingStrategy = get_decoding_strategy(
+            decode_type,
+            temperature=decoding_kwargs.pop("temperature", self.temperature),
+            tanh_clipping=decoding_kwargs.pop("tanh_clipping", self.tanh_clipping),
+            mask_logits=decoding_kwargs.pop("mask_logits", self.mask_logits),
+            store_all_logp=decoding_kwargs.pop("store_all_logp", return_entropy),
+            key="charging_duration",
+            **decoding_kwargs,
+        )
+
+        # Pre-decoding hook: used for the initial step(s) of the decoding strategy
+        td, env, num_starts = decode_strategy_nodes.pre_decoder_hook(td, env)
+
+        # Additionally call a decoder hook if needed before main decoding
+        td, env, hidden_locations = self.location_decoder.pre_decoder_hook(td, env, hidden_l, num_starts)
+
+        td, env, num_starts = decode_strategy_charging.pre_decoder_hook(td, env)
+
+        # Additionally call a decoder hook if needed before main decoding
+        td, env, hidden_charging = self.charging_decoder.pre_decoder_hook(td, env, hidden_c, num_starts)
+        # Main decoding: loop until all sequences are done
+        step = 0
+        while not td["done"].all():
+            logits, mask = self.location_decoder(td, hidden_locations, num_starts)
+            td = decode_strategy_nodes.step(
+                logits,
+                mask,
+                td,
+                action=actions[..., step] if actions is not None else None,
+            )
+            logits, mask = self.charging_decoder(td, hidden_charging, num_starts)
+            td = decode_strategy_charging.step(
+                logits,
+                mask,
+                td,
+                action=actions[..., step] if actions is not None else None,
+            )
+            td = env.step(td)["next"]
+            step += 1
+            if step > max_steps:
+                log.error(
+                    f"Exceeded maximum number of steps ({max_steps}) duing decoding"
+                )
+                break
+
+        # Post-decoding hook: used for the final step(s) of the decoding strategy
+        logprobs, actions, td, env = decode_strategy_nodes.post_decoder_hook(td, env)
+
+        # Output dictionary construction
+        if calc_reward:
+            td.set("reward", env.get_reward(td, actions))
+
+        outdict = {
+            "reward": td["reward"],
+            "log_likelihood": get_log_likelihood(
+                logprobs, actions, td.get("mask", None), return_sum_log_likelihood
+            ),
+        }
+
+        if return_actions:
+            outdict["actions"] = actions
+        if return_entropy:
+            outdict["entropy"] = calculate_entropy(logprobs)
+        if return_hidden:
+            outdict["hidden"] = hidden_l
+        if return_init_embeds:
+            outdict["init_embeds"] = init_embeds_location
+
+        return outdict
+
+
+class MultiAutoregressivePolicy(MultiConstructivePolicy):
+    """Template class for an autoregressive policy, simple wrapper around
+    :class:`rl4co.models.common.constructive.base.ConstructivePolicy`.
+
+    Note:
+        While a decoder is required, an encoder is optional and will be initialized to
+        :class:`rl4co.models.common.constructive.autoregressive.encoder.NoEncoder`.
+        This can be used in decoder-only models in which at each step actions do not depend on
+        previously encoded states.
+    """
+
+    def __init__(
+        self,
+        location_encoder: AutoregressiveEncoder,
+        charging_encoder: AutoregressiveEncoder,
+        location_decoder: AutoregressiveDecoder,
+        charging_decoder: AutoregressiveDecoder,
+        env_name: str = "tsp",
+        temperature: float = 1.0,
+        tanh_clipping: float = 0,
+        mask_logits: bool = True,
+        train_decode_type: str = "multisampling",
+        val_decode_type: str = "greedy",
+        test_decode_type: str = "greedy",
+        **unused_kw,
+    ):
+
+        super(MultiAutoregressivePolicy, self).__init__(
+            location_encoder=location_encoder,
+            charging_encoder=charging_encoder,
+            location_decoder=location_decoder,
+            charging_decoder=charging_decoder,
+            env_name=env_name,
+            temperature=temperature,
+            tanh_clipping=tanh_clipping,
+            mask_logits=mask_logits,
+            train_decode_type=train_decode_type,
+            val_decode_type=val_decode_type,
+            test_decode_type=test_decode_type,
+            **unused_kw,
+        )
+
+
+class MultiAttentionModelPolicy(MultiAutoregressivePolicy):
+    """
+    Attention Model Policy based on Kool et al. (2019): https://arxiv.org/abs/1803.08475.
+    This model first encodes the input graph using a Graph Attention Network (GAT) (:class:`AttentionModelEncoder`)
+    and then decodes the solution using a pointer network (:class:`AttentionModelDecoder`). Cache is used to store the
+    embeddings of the nodes to be used by the decoder to save computation.
+    See :class:`rl4co.models.common.constructive.autoregressive.policy.AutoregressivePolicy` for more details on the inference process.
+
+    Args:
+        encoder: Encoder module, defaults to :class:`AttentionModelEncoder`
+        decoder: Decoder module, defaults to :class:`AttentionModelDecoder`
+        embed_dim: Dimension of the node embeddings
+        num_encoder_layers: Number of layers in the encoder
+        num_heads: Number of heads in the attention layers
+        normalization: Normalization type in the attention layers
+        feedforward_hidden: Dimension of the hidden layer in the feedforward network
+        env_name: Name of the environment used to initialize embeddings
+        encoder_network: Network to use for the encoder
+        init_embedding: Module to use for the initialization of the embeddings
+        context_embedding: Module to use for the context embedding
+        dynamic_embedding: Module to use for the dynamic embedding
+        use_graph_context: Whether to use the graph context
+        linear_bias_decoder: Whether to use a bias in the linear layer of the decoder
+        sdpa_fn_encoder: Function to use for the scaled dot product attention in the encoder
+        sdpa_fn_decoder: Function to use for the scaled dot product attention in the decoder
+        sdpa_fn: (deprecated) Function to use for the scaled dot product attention
+        mask_inner: Whether to mask the inner product
+        out_bias_pointer_attn: Whether to use a bias in the pointer attention
+        check_nan: Whether to check for nan values during decoding
+        temperature: Temperature for the softmax
+        tanh_clipping: Tanh clipping value (see Bello et al., 2016)
+        mask_logits: Whether to mask the logits during decoding
+        train_decode_type: Type of decoding to use during training
+        val_decode_type: Type of decoding to use during validation
+        test_decode_type: Type of decoding to use during testing
+        moe_kwargs: Keyword arguments for MoE,
+            e.g., {"encoder": {"hidden_act": "ReLU", "num_experts": 4, "k": 2, "noisy_gating": True},
+                   "decoder": {"light_version": True, ...}}
+    """
+
+    def __init__(
+        self,
+        embed_dim: int = 128,
+        num_encoder_layers: int = 3,
+        num_heads: int = 8,
+        normalization: str = "batch",
+        feedforward_hidden: int = 512,
+        env_name: str = "tsp",
+        encoder_network: nn.Module = None,
+        init_embedding_location: nn.Module = None,
+        init_embedding_charging: nn.Module = None,
+        context_embedding: nn.Module = None,
+        dynamic_embedding: nn.Module = None,
+        use_graph_context: bool = True,
+        linear_bias_decoder: bool = False,
+        sdpa_fn: Callable = None,
+        sdpa_fn_encoder: Callable = None,
+        sdpa_fn_decoder: Callable = None,
+        mask_inner: bool = True,
+        out_bias_pointer_attn: bool = False,
+        check_nan: bool = True,
+        temperature: float = 1.0,
+        tanh_clipping: float = 10.0,
+        mask_logits: bool = True,
+        train_decode_type: str = "multisampling",
+        val_decode_type: str = "greedy",
+        test_decode_type: str = "greedy",
+        moe_kwargs: dict = {"encoder": None, "decoder": None},
+        **unused_kwargs,
+    ):
+        location_encoder = AttentionModelEncoder(
+            embed_dim=embed_dim,
+            num_heads=num_heads,
+            num_layers=num_encoder_layers,
+            env_name=env_name,
+            normalization=normalization,
+            feedforward_hidden=feedforward_hidden,
+            net=encoder_network,
+            init_embedding=init_embedding_location,
+            sdpa_fn=sdpa_fn if sdpa_fn_encoder is None else sdpa_fn_encoder,
+            moe_kwargs=moe_kwargs["encoder"],
+        )
+
+        charging_encoder = AttentionModelEncoder(
+            embed_dim=embed_dim,
+            num_heads=num_heads,
+            num_layers=num_encoder_layers,
+            env_name=env_name,
+            normalization=normalization,
+            feedforward_hidden=feedforward_hidden,
+            net=encoder_network,
+            init_embedding=init_embedding_charging,
+            sdpa_fn=sdpa_fn if sdpa_fn_encoder is None else sdpa_fn_encoder,
+            moe_kwargs=moe_kwargs["encoder"],
+        )
+
+        location_decoder = AttentionModelDecoder(
+            embed_dim=embed_dim,
+            num_heads=num_heads,
+            env_name=env_name,
+            key="action_mask",
+            context_embedding=context_embedding,
+            dynamic_embedding=dynamic_embedding,
+            sdpa_fn=sdpa_fn if sdpa_fn_decoder is None else sdpa_fn_decoder,
+            mask_inner=mask_inner,
+            out_bias_pointer_attn=out_bias_pointer_attn,
+            linear_bias=linear_bias_decoder,
+            use_graph_context=use_graph_context,
+            check_nan=check_nan,
+            moe_kwargs=moe_kwargs["decoder"],
+        )
+
+        charging_decoder = AttentionModelDecoder(
+            embed_dim=embed_dim,
+            num_heads=num_heads,
+            env_name=env_name,
+            key="charging_duration_mask",
+            context_embedding=context_embedding,
+            dynamic_embedding=dynamic_embedding,
+            sdpa_fn=sdpa_fn if sdpa_fn_decoder is None else sdpa_fn_decoder,
+            mask_inner=mask_inner,
+            out_bias_pointer_attn=out_bias_pointer_attn,
+            linear_bias=linear_bias_decoder,
+            use_graph_context=use_graph_context,
+            check_nan=check_nan,
+            moe_kwargs=moe_kwargs["decoder"],
+        )
+
+        super(MultiAttentionModelPolicy, self).__init__(
+            location_encoder=location_encoder,
+            charging_encoder=charging_encoder,
+            location_decoder=location_decoder,
+            charging_decoder=charging_decoder,
+            env_name=env_name,
+            temperature=temperature,
+            tanh_clipping=tanh_clipping,
+            mask_logits=mask_logits,
+            train_decode_type=train_decode_type,
+            val_decode_type=val_decode_type,
+            test_decode_type=test_decode_type,
+            **unused_kwargs,
+        )
+# td["test"] = torch.zeros((4,2))
+# td["test"][..., 0] = torch.ones(4,1)
+
 
 def main():
     env = MTSPEnv()
@@ -597,27 +1049,33 @@ def main():
                                   context_embedding=MTSPContext(emb_dim),
                                   dynamic_embedding=StaticEmbedding(emb_dim)
                                   )
+    # policy = MultiAttentionModelPolicy(env_name=env.name,
+    #                                    embed_dim=emb_dim,
+    #                                    init_embedding_location=MTSPInitEmbedding(emb_dim),
+    #                                    init_embedding_charging=ChargingInitEmbedding(emb_dim),
+    #                                    context_embedding=MTSPContext(emb_dim),
+    #                                    dynamic_embedding=StaticEmbedding(emb_dim)
+    #                                    )
     model = AttentionModel(env,
                            baseline='rollout',
                            policy=policy,
                            train_data_size=100_000,  # really small size for demo
                            val_data_size=10_000)
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     td_init = env.reset(batch_size=[4]).to(device)
     policy = model.policy.to(device)
-    out = policy(td_init.clone(), env, phase="test", decode_type="greedy", return_actions=True)
-
-    # Plotting
-    print(f"Tour lengths: {[f'{-r.item():.2f}' for r in out['reward']]}")
-    for td, actions in zip(td_init, out['actions'].cpu()):
-        fig = env.render(td, actions)
-        fig.show()
+    # out = policy(td_init.clone(), env, phase="test", decode_type="greedy", return_actions=True)
+    #
+    # print(f"Tour lengths: {[f'{-r.item():.2f}' for r in out['reward']]}")
+    # for td, actions in zip(td_init, out['actions'].cpu()):
+    #     fig = env.render(td, actions)
+    #     fig.show()
 
     trainer = RL4COTrainer(max_epochs=1, devices="auto")
     trainer.fit(model)
 
     # Greedy rollouts over trained model (same states as previous plot)
-    policy = model.policy.to(device)
     out = policy(td_init.clone(), env, phase="test", decode_type="greedy", return_actions=True)
 
     # Plotting

@@ -81,6 +81,7 @@ class AttentionModelDecoder(AutoregressiveDecoder):
         sdpa_fn: callable = None,
         pointer: nn.Module = None,
         moe_kwargs: dict = None,
+        key: str = "action_mask"
     ):
         super().__init__()
 
@@ -89,7 +90,7 @@ class AttentionModelDecoder(AutoregressiveDecoder):
         self.env_name = env_name
         self.embed_dim = embed_dim
         self.num_heads = num_heads
-
+        self.key = key
         assert embed_dim % num_heads == 0
 
         self.context_embedding = (
@@ -187,7 +188,8 @@ class AttentionModelDecoder(AutoregressiveDecoder):
         glimpse_k, glimpse_v, logit_k = self._compute_kvl(cached, td)
 
         # Compute logits
-        mask = td["action_mask"]
+        #mask = td["action_mask"]
+        mask = td[self.key]
         logits = self.pointer(glimpse_q, glimpse_k, glimpse_v, logit_k, mask)
 
         # Now we need to reshape the logits and mask to [B*S,N,...] is num_starts > 1 without dynamic embeddings
