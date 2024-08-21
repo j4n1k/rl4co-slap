@@ -1045,9 +1045,9 @@ def main():
     policy = AttentionModelPolicy(env_name=env.name,
                                   # this is actually not needed since we are initializing the embeddings!
                                   embed_dim=emb_dim,
-                                  init_embedding=MTSPInitEmbedding(emb_dim),
-                                  context_embedding=MTSPContext(emb_dim),
-                                  dynamic_embedding=StaticEmbedding(emb_dim)
+                                  # init_embedding=MTSPInitEmbedding(emb_dim),
+                                  # context_embedding=MTSPContext(emb_dim),
+                                  # dynamic_embedding=StaticEmbedding(emb_dim)
                                   )
     # policy = MultiAttentionModelPolicy(env_name=env.name,
     #                                    embed_dim=emb_dim,
@@ -1059,7 +1059,7 @@ def main():
     model = AttentionModel(env,
                            baseline='rollout',
                            policy=policy,
-                           train_data_size=100_000,  # really small size for demo
+                           train_data_size=10_000,  # really small size for demo
                            val_data_size=10_000)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")

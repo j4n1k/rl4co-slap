@@ -172,6 +172,14 @@ def select_start_nodes(td, env, num_starts):
                     + 1
                 )  # re-add depot index
                 selected = rearrange(selected, "b n -> (n b)")
+        elif env.name == "mtsp":
+            selected = (
+                    torch.multinomial(
+                        td["action_mask"].float(), num_starts, replacement=True
+                    )
+
+            )  # re-add depot index
+            selected = rearrange(selected, "b n -> (n b)")
     return selected
 
 

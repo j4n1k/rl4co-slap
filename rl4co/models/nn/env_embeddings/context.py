@@ -98,42 +98,133 @@ class FFSPContext(EnvContext):
         return cur_stage_emb
 
 
+# class TSPContext(EnvContext):
+#     """Context embedding for the Traveling Salesman Problem (TSP).
+#     Project the following to the embedding space:
+#         - first node embedding
+#         - current node embedding
+#     """
+#
+#     def __init__(self, embed_dim):
+#         super(TSPContext, self).__init__(embed_dim, 2 * embed_dim)
+#         self.W_placeholder = nn.Parameter(
+#             torch.Tensor(2 * self.embed_dim).uniform_(-1, 1)
+#         )
+#
+#     def forward(self, embeddings, td):
+#         batch_size = embeddings.size(0)
+#         # By default, node_dim = -1 (we only have one node embedding per node)
+#         node_dim = (
+#             (-1,) if td["first_node"].dim() == 1 else (td["first_node"].size(-1), -1)
+#         )
+#         if td["i"][(0,) * td["i"].dim()].item() < 1:  # get first item fast
+#             if len(td.batch_size) < 2:
+#                 context_embedding = self.W_placeholder[None, :].expand(
+#                     batch_size, self.W_placeholder.size(-1)
+#                 )
+#             else:
+#                 context_embedding = self.W_placeholder[None, None, :].expand(
+#                     batch_size, td.batch_size[1], self.W_placeholder.size(-1)
+#                 )
+#         else:
+#             context_embedding = gather_by_index(
+#                 embeddings,
+#                 torch.stack([td["first_node"], td["current_node"]], -1).view(
+#                     batch_size, -1
+#                 ),
+#             ).view(batch_size, *node_dim)
+#         return self.project_context(context_embedding)
+
+# class TSPContext(EnvContext):
+#     """Context embedding for the Traveling Salesman Problem (TSP).
+#     Project the following to the embedding space:
+#         - first node embedding
+#         - current node embedding
+#     """
+#
+#     def __init__(self, embed_dim):
+#         super(TSPContext, self).__init__(embed_dim, 2 * embed_dim)
+#         self.W_placeholder = nn.Parameter(
+#             torch.Tensor(2 * self.embed_dim).uniform_(-1, 1)
+#         )
+#
+#     def forward(self, embeddings, td):
+#         batch_size = embeddings.size(0)
+#         # By default, node_dim = -1 (we only have one node embedding per node)
+#         node_dim = (
+#             (-1,) if td["first_node"].dim() == 1 else (td["first_node"].size(-1), -1)
+#         )
+#         if td["i"][(0,) * td["i"].dim()].item() < 1:  # get first item fast
+#             if len(td.batch_size) < 2:
+#                 context_embedding = self.W_placeholder[None, :].expand(
+#                     batch_size, self.W_placeholder.size(-1)
+#                 )
+#             else:
+#                 context_embedding = self.W_placeholder[None, None, :].expand(
+#                     batch_size, td.batch_size[1], self.W_placeholder.size(-1)
+#                 )
+#         else:
+#             context_embedding = gather_by_index(
+#                 embeddings,
+#                 torch.stack([td["charging_node"], td["current_node"]], -1).view(
+#                     batch_size, -1
+#                 ),
+#             ).view(batch_size, *node_dim)
+#         return self.project_context(context_embedding)
+
 class TSPContext(EnvContext):
-    """Context embedding for the Traveling Salesman Problem (TSP).
+    """Context embedding for the Multiple Traveling Salesman Problem (mTSP).
     Project the following to the embedding space:
-        - first node embedding
         - current node embedding
+        - remaining_agents
+        - current_length
+        - max_subtour_length
+        - distance_from_depot
     """
 
-    def __init__(self, embed_dim):
+    def __init__(self, embed_dim, linear_bias=False):
         super(TSPContext, self).__init__(embed_dim, 2 * embed_dim)
-        self.W_placeholder = nn.Parameter(
-            torch.Tensor(2 * self.embed_dim).uniform_(-1, 1)
+        proj_in_dim = (
+            4  # remaining_agents, current_length, max_subtour_length, distance_from_depot, battery level, dist_to_cs
         )
+        self.proj_dynamic_feats = nn.Linear(proj_in_dim, embed_dim, bias=linear_bias)
+
+    def _cur_node_embedding(self, embeddings, td):
+        cur_node_embedding = gather_by_index(embeddings, td["current_node"])
+        return cur_node_embedding.squeeze()
+
+    def _state_embedding(self, embeddings, td):
+        dynamic_feats = torch.stack(
+            [
+                (td["num_agents"] - td["agent_idx"]).float(),
+                td["current_length"],
+                td["max_subtour_length"],
+                # self._distance_from_depot(td),
+                td["battery"].view(td["current_length"].shape),
+                # self._distance_from_cs(td)
+            ],
+            dim=-1,
+        )
+        return self.proj_dynamic_feats(dynamic_feats)
+
+    def _distance_from_depot(self, td):
+        # Euclidean distance from the depot (loc[..., 0, :])
+        cur_loc = gather_by_index(td["locs"], td["current_node"])
+        return torch.norm(cur_loc - td["locs"][..., 0, :], dim=-1)
+
+    def _distance_from_cs(self, td):
+        # Euclidean distance from the depot (loc[..., 0, :])
+        cur_loc = gather_by_index(td["locs"], td["current_node"])
+        return torch.norm(cur_loc - td["locs"][..., 1, :], dim=-1)
 
     def forward(self, embeddings, td):
-        batch_size = embeddings.size(0)
-        # By default, node_dim = -1 (we only have one node embedding per node)
-        node_dim = (
-            (-1,) if td["first_node"].dim() == 1 else (td["first_node"].size(-1), -1)
-        )
-        if td["i"][(0,) * td["i"].dim()].item() < 1:  # get first item fast
-            if len(td.batch_size) < 2:
-                context_embedding = self.W_placeholder[None, :].expand(
-                    batch_size, self.W_placeholder.size(-1)
-                )
-            else:
-                context_embedding = self.W_placeholder[None, None, :].expand(
-                    batch_size, td.batch_size[1], self.W_placeholder.size(-1)
-                )
+        if embeddings.shape[-2] == td["locs"].shape[-2]:
+            state_embedding = self._state_embedding(embeddings, td)
+            cur_node_embedding = self._cur_node_embedding(embeddings, td)
+            context_embedding = torch.cat([cur_node_embedding, state_embedding], -1)
+            return self.project_context(context_embedding)
         else:
-            context_embedding = gather_by_index(
-                embeddings,
-                torch.stack([td["first_node"], td["current_node"]], -1).view(
-                    batch_size, -1
-                ),
-            ).view(batch_size, *node_dim)
-        return self.project_context(context_embedding)
+            return embeddings.new_zeros(embeddings.size(0), self.embed_dim)
 
 
 class VRPContext(EnvContext):
