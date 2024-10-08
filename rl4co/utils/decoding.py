@@ -1,6 +1,6 @@
 import abc
 
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Union, Callable
 
 import torch
 import torch.nn.functional as F
@@ -330,6 +330,7 @@ class DecodingStrategy(metaclass=abc.ABCMeta):
         mask: torch.Tensor,
         td: TensorDict = None,
         action: torch.Tensor = None,
+        env: RL4COEnvBase = None,
         **kwargs,
     ) -> TensorDict:
         """Main decoding operation. This method should be called in a loop until all sequences are done.
@@ -353,7 +354,7 @@ class DecodingStrategy(metaclass=abc.ABCMeta):
             mask_logits=self.mask_logits,
         )
         logprobs, selected_action, td = self._step(
-            logprobs, mask, td, action=action, **kwargs
+            logprobs, mask, td, action=action, env=env, **kwargs
         )
 
         # directly return for improvement methods, since the action for improvement methods is finalized in its own policy
@@ -511,14 +512,13 @@ class BeamSearch(DecodingStrategy):
         self.beam_path = []
 
     def _step(
-        self, logprobs: torch.Tensor, mask: torch.Tensor, td: TensorDict, **kwargs
+        self, logprobs: torch.Tensor, mask: torch.Tensor, td: TensorDict, env: RL4COEnvBase, **kwargs
     ) -> Tuple[torch.Tensor, torch.Tensor, TensorDict]:
         selected, batch_beam_idx = self._make_beam_step(logprobs)
         # select the correct state representation, logprobs and mask according to beam parent
         td = td[batch_beam_idx]
         logprobs = logprobs[batch_beam_idx]
         mask = mask[batch_beam_idx]
-
         assert (
             not (~mask).gather(1, selected.unsqueeze(-1)).data.any()
         ), "infeasible action selected"

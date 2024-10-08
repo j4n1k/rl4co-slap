@@ -1,4 +1,5 @@
 import abc
+import copy
 
 from typing import Any, Callable, Optional, Tuple, Union
 
@@ -234,6 +235,13 @@ class ConstructivePolicy(nn.Module):
                 td,
                 action=actions[..., step] if actions is not None else None,
             )
+            # td_rollout = copy.copy(td)
+            # td_rollout = env.step(td_rollout)["next"]
+            # while not td_rollout["done"].all():
+            #     logits, mask = self.decoder(td_rollout, hidden, num_starts)
+            #     selected = decode_strategy.greedy(logits, mask)
+            #     td_rollout.set("action", selected)
+            #     td_rollout = env.step(td_rollout)["next"]
             td = env.step(td)["next"]
             step += 1
             if step > max_steps:

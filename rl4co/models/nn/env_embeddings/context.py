@@ -183,15 +183,25 @@ class TSPContext(EnvContext):
     """
 
     def __init__(self, embed_dim, linear_bias=False):
-        super(TSPContext, self).__init__(embed_dim, 2 * embed_dim)
+        super(TSPContext, self).__init__(embed_dim, 3 * embed_dim)
         proj_in_dim = (
-            4  # remaining_agents, current_length, max_subtour_length, distance_from_depot, battery level, dist_to_cs
+            7  # remaining_agents, current_length, max_subtour_length, distance_from_depot, battery level, dist_to_cs
         )
         self.proj_dynamic_feats = nn.Linear(proj_in_dim, embed_dim, bias=linear_bias)
 
     def _cur_node_embedding(self, embeddings, td):
-        cur_node_embedding = gather_by_index(embeddings, td["current_node"])
-        return cur_node_embedding.squeeze()
+        #cur_node_embedding = gather_by_index(embeddings, td["current_node"])
+        batch_size = embeddings.size(0)
+        node_dim = (
+            (-1,) if td["first_node"].dim() == 1 else (td["first_node"].size(-1), -1)
+        )
+        cur_node_embedding = gather_by_index(
+            embeddings,
+            torch.stack([td["charging_node"], td["current_node"]], -1).view(
+                batch_size, -1
+            ),
+        )
+        return cur_node_embedding
 
     def _state_embedding(self, embeddings, td):
         dynamic_feats = torch.stack(
@@ -199,9 +209,12 @@ class TSPContext(EnvContext):
                 (td["num_agents"] - td["agent_idx"]).float(),
                 td["current_length"],
                 td["max_subtour_length"],
+                td["max_subtour_duration"],
+                td["current_duration"],
                 # self._distance_from_depot(td),
-                td["battery"].view(td["current_length"].shape),
-                # self._distance_from_cs(td)
+                # td["battery"].view(td["current_length"].shape),
+                (td["battery"] / td["threshold"]).float().view(td["current_length"].shape),
+                (self._distance_from_cs(td) / td["battery"].view(td["current_length"].shape)).float()
             ],
             dim=-1,
         )
@@ -214,14 +227,21 @@ class TSPContext(EnvContext):
 
     def _distance_from_cs(self, td):
         # Euclidean distance from the depot (loc[..., 0, :])
-        cur_loc = gather_by_index(td["locs"], td["current_node"])
-        return torch.norm(cur_loc - td["locs"][..., 1, :], dim=-1)
+        try:
+            cur_loc = gather_by_index(td["cost_matrix"], td["current_node"], dim=2)
+            cur_loc_to_cs = gather_by_index(cur_loc, td["charging_node"], dim=2)
+        except:
+            cur_loc = gather_by_index(td["cost_matrix"], td["current_node"])
+            cur_loc_to_cs = gather_by_index(cur_loc, td["charging_node"])
+        return cur_loc_to_cs
 
     def forward(self, embeddings, td):
         if embeddings.shape[-2] == td["locs"].shape[-2]:
             state_embedding = self._state_embedding(embeddings, td)
-            cur_node_embedding = self._cur_node_embedding(embeddings, td)
-            context_embedding = torch.cat([cur_node_embedding, state_embedding], -1)
+            #cur_node_embedding = self._cur_node_embedding(embeddings, td)
+            cur_node_embedding = gather_by_index(embeddings, td["current_node"])
+            cs_node_embedding = gather_by_index(embeddings, td["charging_node"])
+            context_embedding = torch.cat([cur_node_embedding, cs_node_embedding, state_embedding], -1)
             return self.project_context(context_embedding)
         else:
             return embeddings.new_zeros(embeddings.size(0), self.embed_dim)
