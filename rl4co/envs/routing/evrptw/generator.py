@@ -1,6 +1,8 @@
 from typing import Union, Callable
 
+import numpy as np
 import torch
+from einops import repeat
 
 from torch.distributions import Uniform
 from tensordict.tensordict import TensorDict
@@ -11,7 +13,7 @@ from rl4co.utils.ops import gather_by_index
 
 log = get_pylogger(__name__)
 
-class MTSPGenerator(Generator):
+class EVRPGenerator(Generator):
     """Data generator for the Multiple Travelling Salesman Problem (mTSP).
 
     Args:
@@ -30,6 +32,7 @@ class MTSPGenerator(Generator):
 
     def __init__(
         self,
+        instance_dm: torch.tensor = None,
         n_customers: int = 12,
         n_charging_stations: int = 1,
         min_loc: float = 0.0,
@@ -38,9 +41,13 @@ class MTSPGenerator(Generator):
         max_dist: float = 2.0,
         min_time: float = 0.0,
         max_time: float = 30,
+        h_init: float = 3.9,
+        h_max: float = 3.9,
+        h_final: float = 3.9 * 0.2,
         loc_distribution: Union[int, float, str, type, Callable] = Uniform,
         min_num_agents: int = 4,
         max_num_agents: int = 4,
+        dmat_only: bool = True,
         dist_distribution: Union[
             int, float, str, type, Callable
         ] = Uniform,
@@ -58,8 +65,13 @@ class MTSPGenerator(Generator):
         self.max_time = max_time
         self.min_num_agents = min_num_agents
         self.max_num_agents = max_num_agents
+        self.h_init = h_init
+        self.h_max = h_max
+        self.h_final = h_final
         self.num_loc = self.n_customers + self.n_charging_stations + (max_num_agents * 2)
         self.scale = scale
+        self.dmat_only = dmat_only
+        self.instance_dm = instance_dm
 
         # Location distribution
         if kwargs.get("loc_sampler", None) is not None:
@@ -86,21 +98,29 @@ class MTSPGenerator(Generator):
         # Sample locations
         locs = self.loc_sampler.sample((*batch_size, self.num_loc, 2))
         batch_size = [batch_size] if isinstance(batch_size, int) else batch_size
-        dms = (
-                self.dist_sampler.sample((batch_size + [self.num_loc, self.num_loc]))
-                * (self.max_dist - self.min_dist)
-                + self.min_dist
-        )
-        dms[..., torch.arange(self.num_loc), torch.arange(self.num_loc)] = 0
-        log.info("Using TMAT class (triangle inequality): {}".format(self.tmat_class))
-        if self.tmat_class:
-            while True:
-                old_dms = dms.clone()
-                dms, _ = (
-                        dms[..., :, None, :] + dms[..., None, :, :].transpose(-2, -1)
-                ).min(dim=-1)
-                if (dms == old_dms).all():
-                    break
+        if isinstance(self.instance_dm, np.ndarray):
+            dms = torch.tensor(self.instance_dm).float() / 1000
+            dms = repeat(dms, 'n d -> b n d', b=batch_size[0], d=dms.shape[0])
+            # dms = self.instance_dm
+        else:
+            if self.dmat_only:
+                dms = (
+                        self.dist_sampler.sample((batch_size + [self.num_loc, self.num_loc]))
+                        * (self.max_dist - self.min_dist)
+                        + self.min_dist
+                )
+                dms[..., torch.arange(self.num_loc), torch.arange(self.num_loc)] = 0
+                log.info("Using TMAT class (triangle inequality): {}".format(self.tmat_class))
+                if self.tmat_class:
+                    while True:
+                        old_dms = dms.clone()
+                        dms, _ = (
+                                dms[..., :, None, :] + dms[..., None, :, :].transpose(-2, -1)
+                        ).min(dim=-1)
+                        if (dms == old_dms).all():
+                            break
+            else:
+                dms = self._get_distance_matrix(locs)
         # look-ups for different node types
         nodes = torch.arange(self.num_loc).repeat(batch_size).view(batch_size[0], self.num_loc)
         customer_nodes = nodes[..., 0:self.n_customers]
@@ -174,8 +194,8 @@ class MTSPGenerator(Generator):
 
         # Reset duration at depot to 0
         durations[:, 0] = 0.0
-        h_max = 31
-        h_final = 7
+        # h_max = self.h_max
+        # h_final = self.h_final
         return TensorDict(
             {
                 "locs": locs,
@@ -189,9 +209,10 @@ class MTSPGenerator(Generator):
                 "start_depots": start_depots,
                 "end_depots": end_depots,
                 "due_dates": due_dates,
-                "time_windows": time_windows
-                # "h_max": h_max,
-                # "h_final": h_final
+                "time_windows": time_windows,
+                "h_max": torch.full((*batch_size, 1), self.h_max),
+                "h_final": torch.full((*batch_size, 1), self.h_final),
+                "h_init": torch.full((*batch_size, 1), self.h_init)
             },
             batch_size=batch_size,
         )

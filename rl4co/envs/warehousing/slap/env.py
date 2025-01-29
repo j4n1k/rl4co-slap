@@ -161,6 +161,7 @@ class SLAPEnv(RL4COEnvBase):
 
         locs = td["locs"]
         assigned = td["locs"][actions]
+        freq = td["freq"]
         x, y = locs[:, 0], locs[:, 1]
         x_a, y_a = assigned[:, 0], assigned[:, 1]
 
@@ -168,16 +169,16 @@ class SLAPEnv(RL4COEnvBase):
         ax.scatter(x, y, color="tab:blue")
         ax.scatter(x_a, y_a, color='red', s=100, label='Assigned Products',
                     edgecolor='black')
-        # for i, idx in enumerate(assigned):
-        #     ax.annotate(
-        #         assigned[i],
-        #         (x_a[idx], y_a[idx]),
-        #         textcoords="offset points",
-        #         xytext=(0, 10),
-        #         ha='center',
-        #         fontsize=12,
-        #         color='black'
-        #     )
+        for i, idx in enumerate(assigned):
+            ax.annotate(
+                assigned[i],
+                (x_a[idx], y_a[idx]),
+                textcoords="offset points",
+                xytext=(0, 10),
+                ha='center',
+                fontsize=12,
+                color='black'
+            )
         plt.show()
 
 

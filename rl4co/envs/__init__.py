@@ -32,7 +32,7 @@ from rl4co.envs.scheduling.jssp.env import JSSPEnv
 from rl4co.envs.graph import MCPEnv, FLPEnv
 
 # Warehouse
-from rl4co.envs.warehousing import SLAPEnv
+from rl4co.envs.warehousing import SLAPEnv, OrderBatchingEnv
 
 # Register environments
 ENV_REGISTRY = {
@@ -59,7 +59,8 @@ ENV_REGISTRY = {
     "tsp_kopt": TSPkoptEnv,
     "mcp": MCPEnv,
     "flp": FLPEnv,
-    "slap": SLAPEnv
+    "slap": SLAPEnv,
+    "ob": OrderBatchingEnv
 }
 
 

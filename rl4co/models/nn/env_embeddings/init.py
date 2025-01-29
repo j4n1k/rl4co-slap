@@ -37,6 +37,7 @@ def env_init_embedding(env_name: str, config: dict) -> nn.Module:
         "fjsp": FJSPInitEmbedding,
         "jssp": FJSPInitEmbedding,
         "mtvrp": MTVRPInitEmbedding,
+        "obp": OBPInitEmbedding
     }
 
     if env_name not in embedding_registry:
@@ -510,3 +511,90 @@ class MTVRPInitEmbedding(VRPInitEmbedding):
             )
         )
         return torch.cat((depot_embedding, node_embeddings), -2)
+
+
+class SLAPInitEmbedding(nn.Module):
+    """Initial embedding
+    Embed the following node features to the embedding space:
+        - locs: x, y coordinates of the nodes (cells)
+        - probe: index of the (single) probe cell. We embed the euclidean distance from the probe to all cells.
+    """
+
+    def __init__(self, embed_dim, linear_bias=True):
+        super(SLAPInitEmbedding, self).__init__()
+        node_dim = 1  # x, y, dist_depot
+        self.init_embed = nn.Linear(node_dim, embed_dim, linear_bias)  # locs
+        # self.init_freq = nn.Linear(1, embed_dim, linear_bias)
+        self.init_embed_depot = nn.Linear(2, embed_dim, linear_bias)
+
+    def __forwards(self, td):
+        # node_embeddings = self.init_embed(td["locs"])
+        # node_embeddings = self.init_embed(td["locs"])
+        depot = td["locs"][:, :1, :]
+        storage_locs = td["locs"][:, 1:, :]
+        dist_mat = self._get_distance_matrix(td["locs"])
+        depot_idx = 0
+        depot_to_all_distances = dist_mat[:, depot_idx, :]
+        depot_to_all_distances = torch.cat([
+            depot_to_all_distances[:, :depot_idx],  # Distances before depot index
+            depot_to_all_distances[:, depot_idx + 1:]
+        ], dim=1)
+        node_embeddings = self.init_embed(
+            torch.cat((storage_locs, depot_to_all_distances[..., None]), -1)
+        )
+        depot_embedding = self.init_embed_depot(depot)
+        out = torch.cat((depot_embedding, node_embeddings), -2)
+        return out
+
+    def _forward(self, td):
+        dist_mat = self._get_distance_matrix(td["locs"])
+        depot_idx = 0
+        depot_to_all_distances = dist_mat[:, depot_idx, :]
+        node_embeddings = self.init_embed(
+            torch.cat((td["locs"], depot_to_all_distances[..., None]), -1)
+        )
+        print(node_embeddings.shape)
+        return node_embeddings
+
+    def forward(self, td):
+        dist_mat = self._get_distance_matrix(td["locs"])
+        depot_idx = 0
+        depot_to_all_distances = dist_mat[:, depot_idx, :]
+        node_embeddings = self.init_embed(depot_to_all_distances[..., None])
+        return node_embeddings
+
+    def _distance_depot(self, locs, depot):
+        pass
+
+    @staticmethod
+    def _get_distance_matrix(locs: torch.Tensor):
+        """Compute the Manhattan distance matrix for the given coordinates.
+
+        Args:
+            locs: Tensor of shape [..., n, dim]
+        """
+        if locs.dtype != torch.float32 and locs.dtype != torch.float64:
+            locs = locs.to(torch.float32)
+
+            # Compute pairwise differences
+        diff = locs[..., :, None, :] - locs[..., None, :, :]
+
+        # Compute Manhattan distance
+        distance_matrix = torch.sum(torch.abs(diff), dim=-1)
+        return distance_matrix
+
+
+class OBPInitEmbedding(nn.Module):
+    """Initial embedding for the Traveling Salesman Problems (TSP).
+    Embed the following node features to the embedding space:
+        - locs: x, y coordinates of the cities
+    """
+
+    def __init__(self, embed_dim, linear_bias=True):
+        super(OBPInitEmbedding, self).__init__()
+        node_dim = 1  # x, y
+        self.init_embed = nn.Linear(node_dim, embed_dim, linear_bias)
+
+    def forward(self, td):
+        out = self.init_embed(td["orders_to_assign"][..., None])
+        return out

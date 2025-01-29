@@ -1,5 +1,5 @@
 from rl4co.envs.routing.atsp.env import ATSPEnv
-from rl4co.models import MatNetPolicy, MatNet
+from rl4co.models import MatNetPolicy, MatNet, POMO
 from typing import Optional, List, Tuple
 
 import numpy as np
@@ -22,12 +22,12 @@ from rl4co.models import AttentionModelPolicy, ConstructivePolicy, ConstructiveE
 from rl4co.models.common.constructive.base import NoEncoder
 from rl4co.models.nn.env_embeddings.context import EnvContext
 from rl4co.models.nn.env_embeddings.dynamic import StaticEmbedding
-from rl4co.models.nn.env_embeddings.init import MTSPInitEmbedding
+from rl4co.models.nn.env_embeddings.init import MTSPInitEmbedding, env_init_embedding
 from rl4co.models.zoo.am.decoder import AttentionModelDecoder, PrecomputedCache
 from rl4co.models.zoo.am.encoder import AttentionModelEncoder
 from rl4co.models.zoo import EAS, EASLay, EASEmb, ActiveSearch
 from rl4co.models.zoo.matnet.decoder import MatNetDecoder
-from rl4co.models.zoo.matnet.encoder import MatNetEncoder
+from rl4co.models.zoo.matnet.encoder import MatNetEncoder, MatNetLayer
 from rl4co.utils.decoding import get_log_likelihood, decode_logprobs
 from rl4co.utils import RL4COTrainer
 from rl4co.utils.decoding import DecodingStrategy, get_decoding_strategy, get_log_likelihood, process_logits
@@ -1145,26 +1145,32 @@ else:
     num_encoder_layers = 2
 
 env = MTSPEnv(generator_params={"n_customers": 12, "min_num_agents": 4, "max_num_agents": 4})
-# policy = MatNetPolicy()
-policy = MultiDecisionPolicy(env_name="tsp",
-                             embed_dim=embed_dim,
-                             init_embedding=ChargingInitEmbedding(embed_dim),
-                             context_embedding=MTSPContext(embed_dim))
-model = MatNet(env=env,
-               policy=policy,
-               baseline="shared",
-               batch_size=batch_size,
-               train_data_size=train_data_size,
-               val_data_size=2_000)
+policy = MatNetPolicy()
+# policy = MultiDecisionPolicy(env_name="tsp",
+#                              embed_dim=embed_dim,
+#                              init_embedding=ChargingInitEmbedding(embed_dim),
+#                              context_embedding=MTSPContext(embed_dim))
+# model = MatNet(env=env,
+#                policy=policy,
+#                baseline="shared",
+#                batch_size=batch_size,
+#                train_data_size=train_data_size,
+#                val_data_size=2_000)
+
+model = AttentionModel(env,
+            baseline='rollout',
+            train_data_size=5_000, # really small size for demo
+            val_data_size=2_000,
+            )
 
 td_init = env.reset(batch_size=[4])
 out = policy(td_init.clone(), env, phase="test", decode_type="greedy", return_actions=True)
-for td, actions in zip(td_init, out['actions'].cpu()):
-    fig = env.render(td, actions)
-    fig.show()
+# for td, actions in zip(td_init, out['actions'].cpu()):
+#     fig = env.render(td, actions)
+#     fig.show()
 print(out["reward"])
 print(out["actions"])
-print(out["charging_actions"])
+# print(out["charging_actions"])
 trainer = RL4COTrainer(max_epochs=1, devices="auto")
 trainer.fit(model)
 out = policy(td_init.clone(), env, phase="test", decode_type="sampling", return_actions=True)

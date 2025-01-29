@@ -116,34 +116,45 @@ def render(td, actions=None, ax=None):
             markersize=markersize,
             label=label,
         )
-    actions_result = []
-
-    actions_result.append(start_depots[0])
-    start_depots = start_depots[1:]
-    for action in actions:
-        actions_result.append(action)
-        if action in end_depots and start_depots.size()[0] > 0:
-            actions_result.append(start_depots[0])
-            start_depots = start_depots[1:]
-    if start_depots.size()[0] == 0 and end_depots[-1] not in actions_result:
-        actions_result.append(end_depots[-1])
-
+    actions_result = actions
+    # actions_result = []
+    #
+    # actions_result.append(start_depots[0])
+    # start_depots = start_depots[1:]
+    # for action in actions:
+    #     actions_result.append(action)
+    #     if action in end_depots and start_depots.size()[0] > 0:
+    #         actions_result.append(start_depots[0])
+    #         start_depots = start_depots[1:]
+    # if start_depots.size()[0] == 0 and end_depots[-1] not in actions_result:
+    #     actions_result.append(end_depots[-1])
+    agents_present = 0
+    for node in actions_result:
+        if node in end_depots:
+            agents_present += 1
     # Plot the actions in order
     agent_idx = 1
     agent_travel_time = 0
     max_travel = 0
+    total_travel = 0
     n_charges = {i+1: 0 for i in range(num_agents)}
-    battery_levels = {i+1: [100] for i in range(num_agents)}
+    h = td["h_init"] #* 1000
+    h_max = td["h_max"] #* 1000
+    battery_levels = {i+1: [h] for i in range(num_agents)}
 
     for i in range(len(actions_result)):
         if actions_result[i] in end_depots:
             agent_idx += 1
             idx = list(end_depots.numpy()).index(actions_result[i].item())
             ax.annotate(str(agent_travel_time), right_points[idx])
+            total_travel += agent_travel_time
             if agent_travel_time > max_travel:
                 max_travel = agent_travel_time
             agent_travel_time = 0
-            continue
+            if agent_idx > agents_present:
+                break
+            else:
+                continue
 
         color = cmap(num_agents - agent_idx)
 
@@ -155,13 +166,19 @@ def render(td, actions=None, ax=None):
         from_loc = all_points[from_node]
         to_loc = all_points[to_node]
         travel_time = td["cost_matrix"][from_node, to_node]
+        if agent_idx == 3:
+            pass
+        if from_node in start_depots and to_node in end_depots:
+            travel_time = 0
+        # print(f"Agent {agent_idx}: {from_loc} -> {to_loc} in {travel_time}")
+        energy_consumption = td["energy_consumption"][from_node, to_node]
         if agent_idx <= num_agents:
-            battery_levels[agent_idx].append(battery_levels[agent_idx][-1] - 2 * travel_time)
+            battery_levels[agent_idx].append(battery_levels[agent_idx][-1] - energy_consumption)
         if to_node == charging_node.item():
-            travel_time += 5
+            # travel_time += 5
             n_charges[agent_idx] += 1
-            battery_levels[agent_idx].append(torch.tensor([100]))
-        cur_battery = str(round(battery_levels[agent_idx][-1].item()))
+            battery_levels[agent_idx].append(torch.tensor([h_max]))
+#        cur_battery = str(round(battery_levels[agent_idx][-1].item()))
         agent_travel_time += travel_time
         ax.plot([from_loc[0], to_loc[0]], [from_loc[1], to_loc[1]], color=color)
         ax.annotate(
@@ -171,13 +188,14 @@ def render(td, actions=None, ax=None):
             arrowprops=dict(arrowstyle="->", color=color),
             annotation_clip=False,
         )
-    print(max_travel)
-    print(n_charges)
-    print(battery_levels)
+    # print(max_travel)
+    # print(total_travel)
+    # print(n_charges)
+    # print(battery_levels)
     # Legend
     handles, labels = ax.get_legend_handles_labels()
     ax.legend(handles, labels)
     ax.set_title("mTSP")
     ax.set_xlabel("x-coordinate")
     ax.set_ylabel("y-coordinate")
-    return fig
+    return fig, total_travel

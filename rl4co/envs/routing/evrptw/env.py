@@ -15,10 +15,10 @@ from rl4co.envs.common.base import RL4COEnvBase
 from rl4co.envs.common.utils import batch_to_scalar
 from rl4co.utils.ops import gather_by_index, get_distance, get_tour_length
 
-from .generator import MTSPGenerator
+from .generator import EVRPGenerator
 from .render import render
 
-class MTSPEnv(RL4COEnvBase):
+class EVRPEnv(RL4COEnvBase):
     """Multiple Traveling Salesman Problem environment
     At each step, an agent chooses to visit a city. A maximum of `num_agents` agents can be employed to visit the cities.
     The cost can be defined in two ways:
@@ -50,18 +50,18 @@ class MTSPEnv(RL4COEnvBase):
         generator_params: parameters for the generator
     """
 
-    name = "mtsp"
+    name = "tsp"
 
     def __init__(
         self,
-        generator: MTSPGenerator = None,
+        generator: EVRPGenerator = None,
         generator_params: dict = {},
         cost_type: str = "minmax",
         **kwargs,
     ):
         super().__init__(**kwargs)
         if generator is None:
-            generator = MTSPGenerator(**generator_params)
+            generator = EVRPGenerator(**generator_params)
         self.generator = generator
         self.cost_type = cost_type
         self._make_spec(self.generator)
@@ -170,7 +170,7 @@ class MTSPEnv(RL4COEnvBase):
         # Update subtour service time
         current_duration = td["current_duration"] + dist_traveled
         # Update charging duration if charging action
-        current_duration[cs_mask] += 5
+        current_duration[cs_mask] += 3
 
         # We update the max_subtour_length and reset the current_length
         max_subtour_length = torch.where(
@@ -249,10 +249,12 @@ class MTSPEnv(RL4COEnvBase):
         # available[..., td["charging_node"]] = 0  # charging station is not available as first node
 
         # Battery constraints
-        battery = torch.full((*batch_size, 1), 3.9, dtype=torch.float32)
-        threshold = torch.full(
-            (*batch_size, 1), 0.781, device=device
-        )
+        # battery = torch.full((*batch_size, 1), 3.9, dtype=torch.float32)
+        # threshold = torch.full(
+        #     (*batch_size, 1), 0.781, device=device
+        # )
+        battery = td["h_init"]
+        threshold = td["h_final"]
         values = torch.tensor([3.9], device=device)
         n_th = values.shape[0]
         charging_duration_mask = torch.ones((*batch_size, n_th), dtype=torch.bool, device=device)
@@ -314,7 +316,7 @@ class MTSPEnv(RL4COEnvBase):
         distance_matrix = torch.sum(torch.abs(diff), dim=-1)
         return distance_matrix
 
-    def _make_spec(self, generator: MTSPGenerator):
+    def _make_spec(self, generator: EVRPGenerator):
         """Make the observation and action specs from the parameters."""
         self.observation_spec = CompositeSpec(
             locs=BoundedTensorSpec(

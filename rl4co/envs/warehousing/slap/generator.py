@@ -140,6 +140,7 @@ class SLAPGenerator(Generator):
         dist_mat = self._get_distance_matrix(locs)
         depot_idx = 0
         depot_to_all_distances = dist_mat[:, depot_idx, :]
+
         # assignment = torch.full((*batch_size, self.n_locs * self.n_aisles), -1, dtype=torch.float32)
         assignment = torch.full((*batch_size, self.n_products), -1, dtype=torch.int)
         picklist = self._create_picklist(item_probabilities)
